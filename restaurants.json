@@ -6,6 +6,7 @@
     "voice": "Puck",
     "system_prompt_file": "system_prompt.txt",
     "order_webhook_url": "https://lxurfpnlvmrvarwbzygl.supabase.co/functions/v1/voice-order-webhook",
-    "order_webhook_api_key": ""
+    "order_webhook_api_key": "",
+    "order_webhook_api_key_env": "ORDER_WEBHOOK_API_KEY_CHICHARRON"
   }
 ]

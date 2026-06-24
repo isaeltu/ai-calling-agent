@@ -34,16 +34,23 @@ def load_prompt(file_name: str) -> str:
 def load_restaurants() -> dict:
     """Load restaurant configs from restaurants.json, keyed by Twilio phone number.
 
-    order_webhook_api_key is a secret, so it is kept out of restaurants.json: when a
-    restaurant entry omits it, it falls back to the ORDER_WEBHOOK_API_KEY env var.
+    order_webhook_api_key is a secret, so it is kept out of restaurants.json. Each
+    restaurant instead sets order_webhook_api_key_env to the name of the env var
+    holding its own key (multiple restaurants -> multiple keys -> multiple env vars).
+    A restaurant with no order_webhook_api_key_env falls back to ORDER_WEBHOOK_API_KEY,
+    which is convenient while there is only one restaurant configured.
     """
     restaurants_path = os.path.join(DIR_PATH, "restaurants.json")
     with open(restaurants_path, "r", encoding="utf-8") as file:
         restaurants = json.load(file)
     default_webhook_api_key = os.getenv("ORDER_WEBHOOK_API_KEY")
     for restaurant in restaurants:
-        if not restaurant.get("order_webhook_api_key") and default_webhook_api_key:
-            restaurant["order_webhook_api_key"] = default_webhook_api_key
+        if restaurant.get("order_webhook_api_key"):
+            continue
+        env_var_name = restaurant.get("order_webhook_api_key_env")
+        restaurant["order_webhook_api_key"] = (
+            os.getenv(env_var_name, "") if env_var_name else (default_webhook_api_key or "")
+        )
     return {r["twilio_phone_number"]: r for r in restaurants}
 
 
