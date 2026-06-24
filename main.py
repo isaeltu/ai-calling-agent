@@ -61,6 +61,8 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
 PORT = int(os.getenv("PORT", 8000))
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 
 RESTAURANTS_BY_PHONE = load_restaurants()
 RESTAURANTS_BY_ID = {r["id"]: r for r in RESTAURANTS_BY_PHONE.values()}
@@ -430,10 +432,81 @@ async def submit_order(restaurant: dict, order_args: dict, call_sid) -> dict:
         return {"status": "error", "message": str(e)}
 
 
+async def fetch_menu(restaurant: dict) -> dict | None:
+    """Fetch this restaurant's live menu from RestoPOS via rpc/voice_get_menu.
+
+    Without this, the agent only knows whatever products were typed into the
+    static prompt and ends up offering items that don't exist (or missing
+    real ones); voice_create_order re-validates against the same table when
+    the order is submitted, so this is just for what the agent says out loud.
+    """
+    api_key = restaurant.get("order_webhook_api_key")
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY or not api_key:
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/voice_get_menu",
+                json={"p_api_key": api_key},
+                headers={
+                    "apikey": SUPABASE_ANON_KEY,
+                    "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+                    "Content-Type": "application/json",
+                },
+            )
+        if resp.status_code >= 400:
+            print(f"Error fetching menu for '{restaurant['id']}': HTTP {resp.status_code}")
+            return None
+        return resp.json()
+    except Exception as e:
+        print(f"Error fetching menu for '{restaurant['id']}': {e}")
+        return None
+
+
+def format_menu(menu: dict) -> str:
+    """Render the RestoPOS menu payload as text to append to the system prompt."""
+    products = menu.get("products") or []
+    if not products:
+        return ""
+
+    category_names = {c["id"]: c["name"] for c in menu.get("categories") or []}
+    items_by_category: dict[str, list[str]] = {}
+    for product in products:
+        category_name = category_names.get(product.get("categoryId"), "Otros")
+        line = f"- {product['name']}: {product['price']}"
+        if product.get("description"):
+            line += f" ({product['description']})"
+        items_by_category.setdefault(category_name, []).append(line)
+
+    sections = [
+        f"{category_name}:\n" + "\n".join(lines)
+        for category_name, lines in items_by_category.items()
+    ]
+    return (
+        "MENU ACTUAL (estos son los unicos productos disponibles; usa exactamente "
+        "estos nombres y precios, no inventes otros):\n\n" + "\n\n".join(sections)
+    )
+
+
 async def send_setup_message(gemini_ws, restaurant: dict):
     """Configure the Gemini Live session with this restaurant's prompt and tools."""
     system_message = load_prompt(restaurant.get("system_prompt_file", "system_prompt.txt"))
     voice = restaurant.get("voice", GEMINI_VOICE)
+
+    menu = await fetch_menu(restaurant)
+    if menu:
+        menu_text = format_menu(menu)
+        if menu_text:
+            system_message = f"{system_message}\n\n{menu_text}"
+        extra_prompt = (menu.get("restaurant") or {}).get("extraPrompt")
+        if extra_prompt:
+            system_message = f"{system_message}\n\n{extra_prompt}"
+    else:
+        print(
+            f"Could not load live menu for restaurant '{restaurant['id']}'; "
+            "falling back to the static prompt only."
+        )
 
     setup_message = {
         "setup": {
