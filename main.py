@@ -13,7 +13,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.websockets import WebSocketDisconnect
 from pydantic import BaseModel
 from twilio.rest import Client
-from twilio.twiml.voice_response import Connect, VoiceResponse
+from twilio.twiml.voice_response import Connect, Stream, VoiceResponse
 
 load_dotenv()
 
@@ -205,9 +205,9 @@ async def handle_outgoing_call(request: Request):
     response.say("Please wait while we establish the connection.")
 
     connect = Connect()
-    connect.stream(
-        url=f"wss://{request.url.hostname}/media-stream?restaurant_id={restaurant['id']}"
-    )
+    stream = Stream(url=f"wss://{request.url.hostname}/media-stream")
+    stream.parameter(name="restaurant_id", value=restaurant["id"])
+    connect.append(stream)
     response.append(connect)
     return HTMLResponse(content=str(response), media_type="application/xml")
 
@@ -240,23 +240,38 @@ async def handle_media_stream(websocket: WebSocket):
     print("Client connected")
     await websocket.accept()
 
-    restaurant_id = websocket.query_params.get("restaurant_id")
-    restaurant = RESTAURANTS_BY_ID.get(restaurant_id)
+    # Custom parameters on <Stream> (set in /outgoing-call) arrive in the "start"
+    # event's customParameters, not the connection URL's query string -- some
+    # proxies between Twilio and this server don't reliably forward query strings
+    # on the WebSocket upgrade request.
+    stream_sid = None
+    call_sid = None
+    restaurant_id = None
+    restaurant = None
+    async for message in websocket.iter_text():
+        data = json.loads(message)
+        if data["event"] == "start":
+            stream_sid = data["start"]["streamSid"]
+            call_sid = data["start"].get("callSid")
+            restaurant_id = data["start"].get("customParameters", {}).get("restaurant_id")
+            restaurant = RESTAURANTS_BY_ID.get(restaurant_id)
+            break
+
     if not restaurant:
         print(f"Unknown restaurant_id on media-stream: {restaurant_id}")
         await websocket.close()
         return
 
+    print(f"Incoming stream has started {stream_sid}")
+
     async with websockets.connect(GEMINI_WS_URL) as gemini_ws:
         await send_setup_message(gemini_ws, restaurant)
-        stream_sid = None
-        call_sid = None
         upsample_state = None
         downsample_state = None
 
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to Gemini Live."""
-            nonlocal stream_sid, call_sid, upsample_state
+            nonlocal upsample_state
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
@@ -280,10 +295,6 @@ async def handle_media_stream(websocket: WebSocket):
                             }
                         }
                         await gemini_ws.send(json.dumps(audio_message))
-                    elif data["event"] == "start":
-                        stream_sid = data["start"]["streamSid"]
-                        call_sid = data["start"].get("callSid")
-                        print(f"Incoming stream has started {stream_sid}")
             except WebSocketDisconnect:
                 print("Client disconnected.")
                 if gemini_ws.close_code is None:
@@ -291,7 +302,7 @@ async def handle_media_stream(websocket: WebSocket):
 
         async def send_to_twilio():
             """Receive events from Gemini Live, send audio back to Twilio."""
-            nonlocal stream_sid, downsample_state
+            nonlocal downsample_state
             try:
                 async for gemini_message in gemini_ws:
                     response = json.loads(gemini_message)
