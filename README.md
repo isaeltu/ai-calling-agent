@@ -63,11 +63,11 @@ pip install -r requirements.txt
 Create a `.env` file with the following variables:
 
 ```env
-OPENAI_API_KEY=your_openai_api_key
+GEMINI_API_KEY=your_gemini_api_key
 TWILIO_ACCOUNT_SID=your_twilio_account_sid
 TWILIO_AUTH_TOKEN=your_twilio_auth_token
 TWILIO_PHONE_NUMBER=your_twilio_phone_number
-NGROK_URL=your_ngrok_url
+PUBLIC_BASE_URL=your_ngrok_or_deployed_url
 PORT=8000
 ```
 
@@ -92,12 +92,21 @@ curl -X POST "http://localhost:8000/make-call" \
 
 ```
 ┌─────────────┐    WebSocket   ┌─────────────┐    HTTP/WS    ┌─────────────┐
-│   Twilio    │ ◄────────────► │  FastAPI    │ ◄───────────► │   OpenAI    │
-│   Voice     │                │   Server    │               │ Realtime API│
+│   Twilio    │ ◄────────────► │  FastAPI    │ ◄───────────► │   Gemini    │
+│   Voice     │                │   Server    │               │  Live API   │
 └─────────────┘                └─────────────┘               └─────────────┘
 ```
 
-The system creates a bridge between Twilio's voice services and OpenAI's Realtime API, enabling natural voice conversations with AI.
+The system creates a bridge between Twilio's voice services and Gemini's Live API, enabling natural voice conversations with AI. Twilio streams 8kHz mu-law audio, which the server resamples to/from the 16kHz/24kHz PCM that Gemini Live expects.
+
+## Deployment
+
+This repo includes a `Procfile` for platforms like Railway:
+
+1. Push the repo to GitHub and connect it in Railway (it auto-deploys on every push).
+2. In the Railway project's **Variables** tab, set `GEMINI_API_KEY`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER`. Railway sets `PORT` automatically.
+3. Once deployed, set `PUBLIC_BASE_URL` to the public URL Railway gives the service (e.g. `https://your-app.up.railway.app`) — this replaces ngrok and is what Twilio calls for `/outgoing-call` and `/recording-status`.
+4. `ngrok` is then only needed for local development.
 
 ## Development
 

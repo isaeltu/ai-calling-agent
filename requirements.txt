@@ -4,5 +4,6 @@ uvicorn
 websockets
 pydantic
 python-dotenv
-openai
+python-multipart
 twilio
+audioop-lts; python_version >= "3.13"

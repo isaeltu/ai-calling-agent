@@ -1,4 +1,5 @@
 import asyncio
+import audioop
 import base64
 import json
 import os
@@ -28,29 +29,33 @@ def load_prompt(file_name: str) -> str:
         raise
 
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "models/gemini-3.1-flash-live-preview")
+GEMINI_VOICE = os.getenv("GEMINI_VOICE", "Puck")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
-NGROK_URL = os.getenv("NGROK_URL")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
 PORT = int(os.getenv("PORT", 8000))
 
 SYSTEM_MESSAGE = load_prompt("system_prompt")
-VOICE = "echo"
-LOG_EVENT_TYPES = [
-    "response.content.done",
-    "rate_limits.updated",
-    "response.done",
-    "input_audio_buffer.committed",
-    "input_audio_buffer.speech_stopped",
-    "input_audio_buffer.speech_started",
-    "session.created",
-]
+
+GEMINI_WS_URL = (
+    "wss://generativelanguage.googleapis.com/ws/"
+    "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+    f"?key={GEMINI_API_KEY}"
+)
+
+# Twilio media streams use 8kHz mu-law; Gemini Live expects 16kHz PCM in
+# and returns 24kHz PCM out, so audio is resampled/transcoded both ways.
+TWILIO_SAMPLE_RATE = 8000
+GEMINI_INPUT_SAMPLE_RATE = 16000
+GEMINI_OUTPUT_SAMPLE_RATE = 24000
 
 app = FastAPI()
 
-if not OPENAI_API_KEY:
-    raise ValueError("Missing the OpenAI API key. Please set it in the .env file.")
+if not GEMINI_API_KEY:
+    raise ValueError("Missing the Gemini API key. Please set it in the .env file.")
 
 if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_PHONE_NUMBER:
     raise ValueError("Missing Twilio configuration. Please set it in the .env file.")
@@ -75,11 +80,11 @@ async def make_call(request: CallRequest):
     try:
         client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         call = client.calls.create(
-            url=f"{NGROK_URL}/outgoing-call",
+            url=f"{PUBLIC_BASE_URL}/outgoing-call",
             to=request.to_phone_number,
             from_=TWILIO_PHONE_NUMBER,
             record=True,
-            recording_status_callback=f"{NGROK_URL}/recording-status",
+            recording_status_callback=f"{PUBLIC_BASE_URL}/recording-status",
             recording_status_callback_method="POST",
         )
         print(f"Call initiated with SID: {call.sid}")
@@ -127,97 +132,122 @@ async def handle_recording_status(request: Request):
 
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
-    """Handle WebSocket connections between Twilio and OpenAI."""
+    """Handle WebSocket connections between Twilio and Gemini Live."""
     print("Client connected")
     await websocket.accept()
 
-    async with websockets.connect(
-        "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
-        extra_headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "OpenAI-Beta": "realtime=v1",
-        },
-    ) as openai_ws:
-        await send_session_update(openai_ws)
+    async with websockets.connect(GEMINI_WS_URL) as gemini_ws:
+        await send_setup_message(gemini_ws)
         stream_sid = None
-        session_id = None
+        upsample_state = None
+        downsample_state = None
 
         async def receive_from_twilio():
-            """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
-            nonlocal stream_sid
+            """Receive audio data from Twilio and send it to Gemini Live."""
+            nonlocal stream_sid, upsample_state
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
-                    if data["event"] == "media" and openai_ws.open:
-                        audio_append = {
-                            "type": "input_audio_buffer.append",
-                            "audio": data["media"]["payload"],
+                    if data["event"] == "media" and gemini_ws.close_code is None:
+                        ulaw_bytes = base64.b64decode(data["media"]["payload"])
+                        pcm_8k = audioop.ulaw2lin(ulaw_bytes, 2)
+                        pcm_16k, upsample_state = audioop.ratecv(
+                            pcm_8k,
+                            2,
+                            1,
+                            TWILIO_SAMPLE_RATE,
+                            GEMINI_INPUT_SAMPLE_RATE,
+                            upsample_state,
+                        )
+                        audio_message = {
+                            "realtimeInput": {
+                                "audio": {
+                                    "data": base64.b64encode(pcm_16k).decode("utf-8"),
+                                    "mimeType": f"audio/pcm;rate={GEMINI_INPUT_SAMPLE_RATE}",
+                                }
+                            }
                         }
-                        await openai_ws.send(json.dumps(audio_append))
+                        await gemini_ws.send(json.dumps(audio_message))
                     elif data["event"] == "start":
                         stream_sid = data["start"]["streamSid"]
                         print(f"Incoming stream has started {stream_sid}")
             except WebSocketDisconnect:
                 print("Client disconnected.")
-                if openai_ws.open:
-                    await openai_ws.close()
+                if gemini_ws.close_code is None:
+                    await gemini_ws.close()
 
         async def send_to_twilio():
-            """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
-            nonlocal stream_sid, session_id
+            """Receive events from Gemini Live, send audio back to Twilio."""
+            nonlocal stream_sid, downsample_state
             try:
-                async for openai_message in openai_ws:
-                    response = json.loads(openai_message)
-                    if response["type"] in LOG_EVENT_TYPES:
-                        print(f"Received event: {response['type']}", response)
-                    if response["type"] == "session.created":
-                        session_id = response["session"]["id"]
-                    if response["type"] == "session.updated":
-                        print("Session updated successfully:", response)
-                    if response["type"] == "response.audio.delta" and response.get(
-                        "delta"
-                    ):
-                        try:
-                            audio_payload = base64.b64encode(
-                                base64.b64decode(response["delta"])
-                            ).decode("utf-8")
-                            audio_delta = {
-                                "event": "media",
-                                "streamSid": stream_sid,
-                                "media": {"payload": audio_payload},
-                            }
-                            await websocket.send_json(audio_delta)
-                        except Exception as e:
-                            print(f"Error processing audio data: {e}")
-                    if response["type"] == "conversation.item.created":
-                        print(f"conversation.item.created event: {response}")
-                    if response["type"] == "input_audio_buffer.speech_started":
-                        print("Speech started, interrupting AI response")
+                async for gemini_message in gemini_ws:
+                    response = json.loads(gemini_message)
 
+                    if "setupComplete" in response:
+                        print("Gemini Live session ready")
+                        continue
+
+                    server_content = response.get("serverContent")
+                    if not server_content:
+                        continue
+
+                    if server_content.get("interrupted"):
+                        print("Speech started, interrupting AI response")
                         await websocket.send_json(
                             {"streamSid": stream_sid, "event": "clear"}
                         )
 
-                        interrupt_message = {"type": "response.cancel"}
-                        await openai_ws.send(json.dumps(interrupt_message))
+                    model_turn = server_content.get("modelTurn")
+                    if model_turn:
+                        for part in model_turn.get("parts", []):
+                            inline_data = part.get("inlineData")
+                            if not inline_data or not inline_data.get("data"):
+                                continue
+                            try:
+                                pcm_24k = base64.b64decode(inline_data["data"])
+                                pcm_8k, downsample_state = audioop.ratecv(
+                                    pcm_24k,
+                                    2,
+                                    1,
+                                    GEMINI_OUTPUT_SAMPLE_RATE,
+                                    TWILIO_SAMPLE_RATE,
+                                    downsample_state,
+                                )
+                                ulaw_bytes = audioop.lin2ulaw(pcm_8k, 2)
+                                audio_delta = {
+                                    "event": "media",
+                                    "streamSid": stream_sid,
+                                    "media": {
+                                        "payload": base64.b64encode(
+                                            ulaw_bytes
+                                        ).decode("utf-8")
+                                    },
+                                }
+                                await websocket.send_json(audio_delta)
+                            except Exception as e:
+                                print(f"Error processing audio data: {e}")
             except Exception as e:
                 print(f"Error in send_to_twilio: {e}")
 
         await asyncio.gather(receive_from_twilio(), send_to_twilio())
 
 
-async def send_session_update(openai_ws):
-    """Configure OpenAI session with audio settings and instructions."""
-    session_update = {
-        "type": "session.update",
-        "session": {
-            "input_audio_format": "g711_ulaw",
-            "output_audio_format": "g711_ulaw",
-            "voice": VOICE,
-            "instructions": SYSTEM_MESSAGE,
-            "modalities": ["text", "audio"],
-            "temperature": 0.2,
-        },
+async def send_setup_message(gemini_ws):
+    """Configure the Gemini Live session with audio settings and instructions."""
+    setup_message = {
+        "setup": {
+            "model": GEMINI_LIVE_MODEL,
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "temperature": 0.2,
+                "speechConfig": {
+                    "voiceConfig": {
+                        "prebuiltVoiceConfig": {"voiceName": GEMINI_VOICE}
+                    }
+                },
+            },
+            "systemInstruction": {"parts": [{"text": SYSTEM_MESSAGE}]},
+        }
     }
-    print("Configuring OpenAI session")
-    await openai_ws.send(json.dumps(session_update))
+    print("Configuring Gemini Live session")
+    await gemini_ws.send(json.dumps(setup_message))
