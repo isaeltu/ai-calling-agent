@@ -79,6 +79,15 @@ TWILIO_SAMPLE_RATE = 8000
 GEMINI_INPUT_SAMPLE_RATE = 16000
 GEMINI_OUTPUT_SAMPLE_RATE = 24000
 
+# Gemini Live bills audio input by the minute, and Twilio forwards a media
+# frame every 20ms even during dead air (hold music gaps, line noise,
+# customer thinking). Once a stretch of near-silence has lasted longer than
+# SILENCE_GATE_HANGOVER_MS we stop forwarding it to Gemini -- real speech is
+# always above the RMS threshold and gets sent immediately, so this never
+# trims actual words, only the dead air between them.
+SILENCE_GATE_RMS_THRESHOLD = int(os.getenv("SILENCE_GATE_RMS_THRESHOLD", "300"))
+SILENCE_GATE_HANGOVER_MS = float(os.getenv("SILENCE_GATE_HANGOVER_MS", "400"))
+
 SUBMIT_ORDER_TOOL = {
     "functionDeclarations": [
         {
@@ -274,12 +283,22 @@ async def handle_media_stream(websocket: WebSocket):
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to Gemini Live."""
             nonlocal upsample_state
+            silence_ms = 0.0
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
                     if data["event"] == "media" and gemini_ws.close_code is None:
                         ulaw_bytes = base64.b64decode(data["media"]["payload"])
                         pcm_8k = audioop.ulaw2lin(ulaw_bytes, 2)
+
+                        frame_ms = (len(pcm_8k) / 2) / TWILIO_SAMPLE_RATE * 1000
+                        if audioop.rms(pcm_8k, 2) < SILENCE_GATE_RMS_THRESHOLD:
+                            silence_ms += frame_ms
+                        else:
+                            silence_ms = 0.0
+                        if silence_ms > SILENCE_GATE_HANGOVER_MS:
+                            continue
+
                         pcm_16k, upsample_state = audioop.ratecv(
                             pcm_8k,
                             2,
