@@ -1,0 +1,11 @@
+[
+  {
+    "id": "demo-restaurant",
+    "name": "Demo Restaurant",
+    "twilio_phone_number": "+16823843954",
+    "voice": "Puck",
+    "system_prompt_file": "system_prompt.txt",
+    "order_webhook_url": "https://REPLACE_WITH_YOUR_WEBAPP/api/orders/from-call",
+    "order_webhook_api_key": "REPLACE_WITH_YOUR_API_KEY"
+  }
+]
