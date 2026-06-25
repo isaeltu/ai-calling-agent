@@ -88,6 +88,15 @@ GEMINI_OUTPUT_SAMPLE_RATE = 24000
 SILENCE_GATE_RMS_THRESHOLD = int(os.getenv("SILENCE_GATE_RMS_THRESHOLD", "300"))
 SILENCE_GATE_HANGOVER_MS = float(os.getenv("SILENCE_GATE_HANGOVER_MS", "400"))
 
+# Gemini Live's default VAD is tuned for dictation, not a phone call -- it waits
+# longer than a caller expects before deciding they're done talking. Lowering
+# silenceDurationMs (and raising end-of-speech sensitivity) makes it commit to
+# "the customer finished" sooner, so the agent starts answering faster. Lowering
+# prefixPaddingMs (start-of-speech sensitivity) shaves the same delay off the
+# other end, at the start of each utterance.
+GEMINI_END_OF_SPEECH_SILENCE_MS = int(os.getenv("GEMINI_END_OF_SPEECH_SILENCE_MS", "300"))
+GEMINI_START_OF_SPEECH_PADDING_MS = int(os.getenv("GEMINI_START_OF_SPEECH_PADDING_MS", "100"))
+
 SUBMIT_ORDER_TOOL = {
     "functionDeclarations": [
         {
@@ -536,6 +545,14 @@ async def send_setup_message(gemini_ws, restaurant: dict):
                 "speechConfig": {
                     "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}
                 },
+            },
+            "realtimeInputConfig": {
+                "automaticActivityDetection": {
+                    "startOfSpeechSensitivity": "START_SENSITIVITY_HIGH",
+                    "endOfSpeechSensitivity": "END_SENSITIVITY_HIGH",
+                    "prefixPaddingMs": GEMINI_START_OF_SPEECH_PADDING_MS,
+                    "silenceDurationMs": GEMINI_END_OF_SPEECH_SILENCE_MS,
+                }
             },
             "systemInstruction": {"parts": [{"text": system_message}]},
             "tools": [SUBMIT_ORDER_TOOL],
