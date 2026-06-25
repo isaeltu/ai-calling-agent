@@ -12,8 +12,8 @@ from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import HTMLResponse
 from fastapi.websockets import WebSocketDisconnect
 from pydantic import BaseModel
-from signalwire.rest import Client
-from signalwire.voice_response import Connect, Stream, VoiceResponse
+from twilio.rest import Client
+from twilio.twiml.voice_response import Connect, Stream, VoiceResponse
 
 load_dotenv()
 
@@ -32,7 +32,7 @@ def load_prompt(file_name: str) -> str:
 
 
 def load_restaurants() -> dict:
-    """Load restaurant configs from restaurants.json, keyed by phone number.
+    """Load restaurant configs from restaurants.json, keyed by Twilio phone number.
 
     order_webhook_api_key is a secret, so it is kept out of restaurants.json. Each
     restaurant instead sets order_webhook_api_key_env to the name of the env var
@@ -51,15 +51,14 @@ def load_restaurants() -> dict:
         restaurant["order_webhook_api_key"] = (
             os.getenv(env_var_name, "") if env_var_name else (default_webhook_api_key or "")
         )
-    return {r["phone_number"]: r for r in restaurants}
+    return {r["twilio_phone_number"]: r for r in restaurants}
 
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "models/gemini-3.1-flash-live-preview")
 GEMINI_VOICE = os.getenv("GEMINI_VOICE", "Puck")
-SIGNALWIRE_PROJECT_ID = os.getenv("SIGNALWIRE_PROJECT_ID")
-SIGNALWIRE_TOKEN = os.getenv("SIGNALWIRE_TOKEN")
-SIGNALWIRE_SPACE_URL = os.getenv("SIGNALWIRE_SPACE_URL")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
 PORT = int(os.getenv("PORT", 8000))
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -153,8 +152,8 @@ app = FastAPI()
 if not GEMINI_API_KEY:
     raise ValueError("Missing the Gemini API key. Please set it in the .env file.")
 
-if not SIGNALWIRE_PROJECT_ID or not SIGNALWIRE_TOKEN or not SIGNALWIRE_SPACE_URL:
-    raise ValueError("Missing SignalWire configuration. Please set it in the .env file.")
+if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+    raise ValueError("Missing Twilio configuration. Please set it in the .env file.")
 
 
 @app.get("/")
@@ -179,15 +178,11 @@ async def make_call(request: CallRequest):
         }
 
     try:
-        client = Client(
-            SIGNALWIRE_PROJECT_ID,
-            SIGNALWIRE_TOKEN,
-            signalwire_space_url=SIGNALWIRE_SPACE_URL,
-        )
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         call = client.calls.create(
             url=f"{PUBLIC_BASE_URL}/outgoing-call?restaurant_id={restaurant['id']}",
             to=request.to_phone_number,
-            from_=restaurant["phone_number"],
+            from_=restaurant["twilio_phone_number"],
             record=True,
             recording_status_callback=f"{PUBLIC_BASE_URL}/recording-status",
             recording_status_callback_method="POST",
