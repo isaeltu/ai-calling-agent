@@ -94,7 +94,7 @@ SILENCE_GATE_HANGOVER_MS = float(os.getenv("SILENCE_GATE_HANGOVER_MS", "400"))
 # "the customer finished" sooner, so the agent starts answering faster. Lowering
 # prefixPaddingMs (start-of-speech sensitivity) shaves the same delay off the
 # other end, at the start of each utterance.
-GEMINI_END_OF_SPEECH_SILENCE_MS = int(os.getenv("GEMINI_END_OF_SPEECH_SILENCE_MS", "300"))
+GEMINI_END_OF_SPEECH_SILENCE_MS = int(os.getenv("GEMINI_END_OF_SPEECH_SILENCE_MS", "200"))
 GEMINI_START_OF_SPEECH_PADDING_MS = int(os.getenv("GEMINI_START_OF_SPEECH_PADDING_MS", "100"))
 
 SUBMIT_ORDER_TOOL = {
@@ -220,10 +220,6 @@ async def handle_outgoing_call(request: Request):
         response.hangup()
         return HTMLResponse(content=str(response), media_type="application/xml")
 
-    response.say(f"Hello! You are now connected to {restaurant['name']}'s AI assistant.")
-    response.pause(length=1)
-    response.say("Please wait while we establish the connection.")
-
     connect = Connect()
     stream = Stream(url=f"wss://{request.url.hostname}/media-stream")
     stream.parameter(name="restaurant_id", value=restaurant["id"])
@@ -339,6 +335,31 @@ async def handle_media_stream(websocket: WebSocket):
 
                     if "setupComplete" in response:
                         print("Gemini Live session ready")
+                        await gemini_ws.send(
+                            json.dumps(
+                                {
+                                    "clientContent": {
+                                        "turns": [
+                                            {
+                                                "role": "user",
+                                                "parts": [
+                                                    {
+                                                        "text": (
+                                                            "[Inicio de llamada. Saluda al "
+                                                            "cliente ahora mismo: di el nombre "
+                                                            "del restaurante y pregunta en que "
+                                                            "le puedes ayudar hoy. No esperes a "
+                                                            "que el cliente hable primero.]"
+                                                        )
+                                                    }
+                                                ],
+                                            }
+                                        ],
+                                        "turnComplete": True,
+                                    }
+                                }
+                            )
+                        )
                         continue
 
                     tool_call = response.get("toolCall")
@@ -520,6 +541,7 @@ def format_menu(menu: dict) -> str:
 async def send_setup_message(gemini_ws, restaurant: dict):
     """Configure the Gemini Live session with this restaurant's prompt and tools."""
     system_message = load_prompt(restaurant.get("system_prompt_file", "system_prompt.txt"))
+    system_message = f"Nombre del restaurante: {restaurant['name']}\n\n{system_message}"
     voice = restaurant.get("voice", GEMINI_VOICE)
 
     menu = await fetch_menu(restaurant)
