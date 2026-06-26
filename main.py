@@ -3,6 +3,7 @@ import audioop
 import base64
 import json
 import os
+import time
 from datetime import datetime, timezone
 
 import httpx
@@ -94,7 +95,7 @@ SILENCE_GATE_HANGOVER_MS = float(os.getenv("SILENCE_GATE_HANGOVER_MS", "400"))
 # "the customer finished" sooner, so the agent starts answering faster. Lowering
 # prefixPaddingMs (start-of-speech sensitivity) shaves the same delay off the
 # other end, at the start of each utterance.
-GEMINI_END_OF_SPEECH_SILENCE_MS = int(os.getenv("GEMINI_END_OF_SPEECH_SILENCE_MS", "200"))
+GEMINI_END_OF_SPEECH_SILENCE_MS = int(os.getenv("GEMINI_END_OF_SPEECH_SILENCE_MS", "150"))
 GEMINI_START_OF_SPEECH_PADDING_MS = int(os.getenv("GEMINI_START_OF_SPEECH_PADDING_MS", "100"))
 
 SUBMIT_ORDER_TOOL = {
@@ -284,11 +285,16 @@ async def handle_media_stream(websocket: WebSocket):
         await send_setup_message(gemini_ws, restaurant)
         upsample_state = None
         downsample_state = None
+        # Wall-clock markers used only to log real turn-around latency (last
+        # moment we saw real speech -> first response audio byte) so it can be
+        # read straight out of Railway logs instead of guessed at.
+        last_speech_end = None
 
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to Gemini Live."""
-            nonlocal upsample_state
+            nonlocal upsample_state, last_speech_end
             silence_ms = 0.0
+            was_speaking = False
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
@@ -297,10 +303,15 @@ async def handle_media_stream(websocket: WebSocket):
                         pcm_8k = audioop.ulaw2lin(ulaw_bytes, 2)
 
                         frame_ms = (len(pcm_8k) / 2) / TWILIO_SAMPLE_RATE * 1000
-                        if audioop.rms(pcm_8k, 2) < SILENCE_GATE_RMS_THRESHOLD:
-                            silence_ms += frame_ms
-                        else:
+                        is_speech = audioop.rms(pcm_8k, 2) >= SILENCE_GATE_RMS_THRESHOLD
+                        if is_speech:
                             silence_ms = 0.0
+                            was_speaking = True
+                        else:
+                            if was_speaking:
+                                last_speech_end = time.monotonic()
+                                was_speaking = False
+                            silence_ms += frame_ms
                         if silence_ms > SILENCE_GATE_HANGOVER_MS:
                             continue
 
@@ -328,7 +339,7 @@ async def handle_media_stream(websocket: WebSocket):
 
         async def send_to_twilio():
             """Receive events from Gemini Live, send audio back to Twilio."""
-            nonlocal downsample_state
+            nonlocal downsample_state, last_speech_end
             try:
                 async for gemini_message in gemini_ws:
                     response = json.loads(gemini_message)
@@ -383,6 +394,10 @@ async def handle_media_stream(websocket: WebSocket):
                             inline_data = part.get("inlineData")
                             if not inline_data or not inline_data.get("data"):
                                 continue
+                            if last_speech_end is not None:
+                                latency_ms = (time.monotonic() - last_speech_end) * 1000
+                                print(f"Response latency (silence -> first audio byte): {latency_ms:.0f}ms")
+                                last_speech_end = None
                             try:
                                 pcm_24k = base64.b64decode(inline_data["data"])
                                 pcm_8k, downsample_state = audioop.ratecv(
