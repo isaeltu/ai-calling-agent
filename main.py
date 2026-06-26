@@ -96,7 +96,7 @@ SILENCE_GATE_HANGOVER_MS = float(os.getenv("SILENCE_GATE_HANGOVER_MS", "400"))
 # prefixPaddingMs (start-of-speech sensitivity) shaves the same delay off the
 # other end, at the start of each utterance.
 GEMINI_END_OF_SPEECH_SILENCE_MS = int(os.getenv("GEMINI_END_OF_SPEECH_SILENCE_MS", "150"))
-GEMINI_START_OF_SPEECH_PADDING_MS = int(os.getenv("GEMINI_START_OF_SPEECH_PADDING_MS", "100"))
+GEMINI_START_OF_SPEECH_PADDING_MS = int(os.getenv("GEMINI_START_OF_SPEECH_PADDING_MS", "50"))
 
 SUBMIT_ORDER_TOOL = {
     "functionDeclarations": [
