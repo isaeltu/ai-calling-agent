@@ -210,9 +210,16 @@ async def handle_outgoing_call(request: Request):
     restaurant_id = request.query_params.get("restaurant_id")
     restaurant = RESTAURANTS_BY_ID.get(restaurant_id) if restaurant_id else None
 
-    if not restaurant and request.method == "POST":
+    customer_phone = None
+    if request.method == "POST":
         form_data = await request.form()
-        restaurant = RESTAURANTS_BY_PHONE.get(form_data.get("To"))
+        if not restaurant:
+            restaurant = RESTAURANTS_BY_PHONE.get(form_data.get("To"))
+        restaurant_number = restaurant.get("twilio_phone_number") if restaurant else None
+        for field in (form_data.get("From"), form_data.get("To")):
+            if field and field != restaurant_number:
+                customer_phone = field
+                break
 
     response = VoiceResponse()
 
@@ -224,6 +231,8 @@ async def handle_outgoing_call(request: Request):
     connect = Connect()
     stream = Stream(url=f"wss://{request.url.hostname}/media-stream")
     stream.parameter(name="restaurant_id", value=restaurant["id"])
+    if customer_phone:
+        stream.parameter(name="customer_phone", value=customer_phone)
     connect.append(stream)
     response.append(connect)
     return HTMLResponse(content=str(response), media_type="application/xml")
@@ -265,12 +274,15 @@ async def handle_media_stream(websocket: WebSocket):
     call_sid = None
     restaurant_id = None
     restaurant = None
+    customer_phone = None
     async for message in websocket.iter_text():
         data = json.loads(message)
         if data["event"] == "start":
             stream_sid = data["start"]["streamSid"]
             call_sid = data["start"].get("callSid")
-            restaurant_id = data["start"].get("customParameters", {}).get("restaurant_id")
+            custom_params = data["start"].get("customParameters", {})
+            restaurant_id = custom_params.get("restaurant_id")
+            customer_phone = custom_params.get("customer_phone")
             restaurant = RESTAURANTS_BY_ID.get(restaurant_id)
             break
 
@@ -289,6 +301,17 @@ async def handle_media_stream(websocket: WebSocket):
         # moment we saw real speech -> first response audio byte) so it can be
         # read straight out of Railway logs instead of guessed at.
         last_speech_end = None
+        call_started_at = datetime.now(timezone.utc)
+        transcript = []
+        pending_role = None
+        pending_text = ""
+
+        def flush_pending_transcript():
+            nonlocal pending_role, pending_text
+            if pending_role and pending_text.strip():
+                transcript.append({"role": pending_role, "text": pending_text.strip()})
+            pending_role = None
+            pending_text = ""
 
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to Gemini Live."""
@@ -339,7 +362,7 @@ async def handle_media_stream(websocket: WebSocket):
 
         async def send_to_twilio():
             """Receive events from Gemini Live, send audio back to Twilio."""
-            nonlocal downsample_state, last_speech_end
+            nonlocal downsample_state, last_speech_end, pending_role, pending_text
             try:
                 async for gemini_message in gemini_ws:
                     response = json.loads(gemini_message)
@@ -388,6 +411,20 @@ async def handle_media_stream(websocket: WebSocket):
                             {"streamSid": stream_sid, "event": "clear"}
                         )
 
+                    input_transcription = server_content.get("inputTranscription")
+                    if input_transcription and input_transcription.get("text"):
+                        if pending_role != "customer":
+                            flush_pending_transcript()
+                            pending_role = "customer"
+                        pending_text += input_transcription["text"]
+
+                    output_transcription = server_content.get("outputTranscription")
+                    if output_transcription and output_transcription.get("text"):
+                        if pending_role != "assistant":
+                            flush_pending_transcript()
+                            pending_role = "assistant"
+                        pending_text += output_transcription["text"]
+
                     model_turn = server_content.get("modelTurn")
                     if model_turn:
                         for part in model_turn.get("parts", []):
@@ -425,6 +462,8 @@ async def handle_media_stream(websocket: WebSocket):
                 print(f"Error in send_to_twilio: {e}")
 
         await asyncio.gather(receive_from_twilio(), send_to_twilio())
+        flush_pending_transcript()
+        await log_call(restaurant, call_sid, customer_phone, transcript, call_started_at)
 
 
 async def handle_tool_call(gemini_ws, tool_call: dict, restaurant: dict, call_sid):
@@ -494,6 +533,41 @@ async def submit_order(restaurant: dict, order_args: dict, call_sid) -> dict:
     except Exception as e:
         print(f"Error submitting order to {webhook_url}: {e}")
         return {"status": "error", "message": str(e)}
+
+
+async def log_call(restaurant: dict, call_sid, customer_phone, transcript: list, started_at) -> None:
+    """Save the call's transcript to RestoPOS via rpc/voice_log_call.
+
+    Best-effort and never raises: today a call that doesn't end in an order
+    leaves no trace anywhere, and a logging failure shouldn't be allowed to
+    look like a call failure to whoever's debugging this.
+    """
+    api_key = restaurant.get("order_webhook_api_key")
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY or not api_key or not call_sid:
+        return
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/voice_log_call",
+                json={
+                    "p_api_key": api_key,
+                    "p_call_sid": call_sid,
+                    "p_customer_phone": customer_phone,
+                    "p_transcript": transcript,
+                    "p_started_at": started_at.isoformat(),
+                    "p_ended_at": datetime.now(timezone.utc).isoformat(),
+                },
+                headers={
+                    "apikey": SUPABASE_ANON_KEY,
+                    "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+                    "Content-Type": "application/json",
+                },
+            )
+        if resp.status_code >= 400:
+            print(f"Error logging call '{call_sid}': HTTP {resp.status_code} {resp.text}")
+    except Exception as e:
+        print(f"Error logging call '{call_sid}': {e}")
 
 
 async def fetch_menu(restaurant: dict) -> dict | None:
@@ -591,6 +665,8 @@ async def send_setup_message(gemini_ws, restaurant: dict):
                     "silenceDurationMs": GEMINI_END_OF_SPEECH_SILENCE_MS,
                 }
             },
+            "inputAudioTranscription": {},
+            "outputAudioTranscription": {},
             "systemInstruction": {"parts": [{"text": system_message}]},
             "tools": [SUBMIT_ORDER_TOOL],
         }
