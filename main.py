@@ -98,6 +98,16 @@ SILENCE_GATE_HANGOVER_MS = float(os.getenv("SILENCE_GATE_HANGOVER_MS", "400"))
 GEMINI_END_OF_SPEECH_SILENCE_MS = int(os.getenv("GEMINI_END_OF_SPEECH_SILENCE_MS", "150"))
 GEMINI_START_OF_SPEECH_PADDING_MS = int(os.getenv("GEMINI_START_OF_SPEECH_PADDING_MS", "50"))
 
+# Safety net, not the primary brevity control (that's the prompt's "1-2
+# sentences" instruction, which works most of the time). This preview model
+# occasionally gets stuck generating mostly silence/filler audio for very
+# little new spoken text -- doubling this budget in testing made a stuck
+# response run *longer* (17s vs 7s) without producing meaningfully more
+# words, so a low cap that cuts the rare bad case off quickly beats a high
+# one hoping it "finishes". Normal replies finish in ~75-100 tokens (~3-4s),
+# well under this.
+GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "220"))
+
 SUBMIT_ORDER_TOOL = {
     "functionDeclarations": [
         {
@@ -689,6 +699,7 @@ async def send_setup_message(gemini_ws, restaurant: dict, resume_handle: str | N
             "generationConfig": {
                 "responseModalities": ["AUDIO"],
                 "temperature": 0.2,
+                "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS,
                 "speechConfig": {
                     "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}
                 },
