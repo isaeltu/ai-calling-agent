@@ -293,177 +293,213 @@ async def handle_media_stream(websocket: WebSocket):
 
     print(f"Incoming stream has started {stream_sid}")
 
-    async with websockets.connect(GEMINI_WS_URL) as gemini_ws:
-        await send_setup_message(gemini_ws, restaurant)
-        upsample_state = None
-        downsample_state = None
-        # Wall-clock markers used only to log real turn-around latency (last
-        # moment we saw real speech -> first response audio byte) so it can be
-        # read straight out of Railway logs instead of guessed at.
-        last_speech_end = None
-        call_started_at = datetime.now(timezone.utc)
-        transcript = []
+    upsample_state = None
+    downsample_state = None
+    # Wall-clock markers used only to log real turn-around latency (last
+    # moment we saw real speech -> first response audio byte) so it can be
+    # read straight out of Railway logs instead of guessed at.
+    last_speech_end = None
+    call_started_at = datetime.now(timezone.utc)
+    transcript = []
+    pending_role = None
+    pending_text = ""
+    # The Live API is preview-only right now (no stable/GA native-audio model
+    # exists), and preview models are subject to Google-side capacity limits
+    # shared across all users, not just our own quota -- this project's quota
+    # dashboard can show near-zero usage and we'll still get a mid-call 1011
+    # "Resource has been exhausted" close. Reconnecting with the session's
+    # resumption handle (instead of just letting the call go silent) is the
+    # one thing actually in our control here.
+    session_resumption_handle = None
+    MAX_GEMINI_RECONNECTS = 2
+
+    def flush_pending_transcript():
+        nonlocal pending_role, pending_text
+        if pending_role and pending_text.strip():
+            transcript.append({"role": pending_role, "text": pending_text.strip()})
         pending_role = None
         pending_text = ""
 
-        def flush_pending_transcript():
-            nonlocal pending_role, pending_text
-            if pending_role and pending_text.strip():
-                transcript.append({"role": pending_role, "text": pending_text.strip()})
-            pending_role = None
-            pending_text = ""
+    for attempt in range(MAX_GEMINI_RECONNECTS + 1):
+        is_resume = session_resumption_handle is not None
+        try:
+            async with websockets.connect(GEMINI_WS_URL) as gemini_ws:
+                await send_setup_message(gemini_ws, restaurant, resume_handle=session_resumption_handle)
 
-        async def receive_from_twilio():
-            """Receive audio data from Twilio and send it to Gemini Live."""
-            nonlocal upsample_state, last_speech_end
-            silence_ms = 0.0
-            was_speaking = False
-            try:
-                async for message in websocket.iter_text():
-                    data = json.loads(message)
-                    if data["event"] == "media" and gemini_ws.close_code is None:
-                        ulaw_bytes = base64.b64decode(data["media"]["payload"])
-                        pcm_8k = audioop.ulaw2lin(ulaw_bytes, 2)
+                async def receive_from_twilio():
+                    """Receive audio data from Twilio and send it to Gemini Live."""
+                    nonlocal upsample_state, last_speech_end
+                    silence_ms = 0.0
+                    was_speaking = False
+                    try:
+                        async for message in websocket.iter_text():
+                            data = json.loads(message)
+                            if data["event"] == "media" and gemini_ws.close_code is None:
+                                ulaw_bytes = base64.b64decode(data["media"]["payload"])
+                                pcm_8k = audioop.ulaw2lin(ulaw_bytes, 2)
 
-                        frame_ms = (len(pcm_8k) / 2) / TWILIO_SAMPLE_RATE * 1000
-                        is_speech = audioop.rms(pcm_8k, 2) >= SILENCE_GATE_RMS_THRESHOLD
-                        if is_speech:
-                            silence_ms = 0.0
-                            was_speaking = True
-                        else:
-                            if was_speaking:
-                                last_speech_end = time.monotonic()
-                                was_speaking = False
-                            silence_ms += frame_ms
-                        if silence_ms > SILENCE_GATE_HANGOVER_MS:
-                            continue
+                                frame_ms = (len(pcm_8k) / 2) / TWILIO_SAMPLE_RATE * 1000
+                                is_speech = audioop.rms(pcm_8k, 2) >= SILENCE_GATE_RMS_THRESHOLD
+                                if is_speech:
+                                    silence_ms = 0.0
+                                    was_speaking = True
+                                else:
+                                    if was_speaking:
+                                        last_speech_end = time.monotonic()
+                                        was_speaking = False
+                                    silence_ms += frame_ms
+                                if silence_ms > SILENCE_GATE_HANGOVER_MS:
+                                    continue
 
-                        pcm_16k, upsample_state = audioop.ratecv(
-                            pcm_8k,
-                            2,
-                            1,
-                            TWILIO_SAMPLE_RATE,
-                            GEMINI_INPUT_SAMPLE_RATE,
-                            upsample_state,
-                        )
-                        audio_message = {
-                            "realtimeInput": {
-                                "audio": {
-                                    "data": base64.b64encode(pcm_16k).decode("utf-8"),
-                                    "mimeType": f"audio/pcm;rate={GEMINI_INPUT_SAMPLE_RATE}",
-                                }
-                            }
-                        }
-                        await gemini_ws.send(json.dumps(audio_message))
-            except WebSocketDisconnect:
-                print("Client disconnected.")
-                if gemini_ws.close_code is None:
-                    await gemini_ws.close()
-
-        async def send_to_twilio():
-            """Receive events from Gemini Live, send audio back to Twilio."""
-            nonlocal downsample_state, last_speech_end, pending_role, pending_text
-            try:
-                async for gemini_message in gemini_ws:
-                    response = json.loads(gemini_message)
-
-                    if "setupComplete" in response:
-                        print("Gemini Live session ready")
-                        await gemini_ws.send(
-                            json.dumps(
-                                {
-                                    "clientContent": {
-                                        "turns": [
-                                            {
-                                                "role": "user",
-                                                "parts": [
-                                                    {
-                                                        "text": (
-                                                            "[Inicio de llamada. Saluda al "
-                                                            "cliente ahora mismo: di el nombre "
-                                                            "del restaurante y pregunta en que "
-                                                            "le puedes ayudar hoy. No esperes a "
-                                                            "que el cliente hable primero.]"
-                                                        )
-                                                    }
-                                                ],
-                                            }
-                                        ],
-                                        "turnComplete": True,
-                                    }
-                                }
-                            )
-                        )
-                        continue
-
-                    tool_call = response.get("toolCall")
-                    if tool_call:
-                        await handle_tool_call(gemini_ws, tool_call, restaurant, call_sid)
-                        continue
-
-                    server_content = response.get("serverContent")
-                    if not server_content:
-                        continue
-
-                    if server_content.get("interrupted"):
-                        print("Speech started, interrupting AI response")
-                        await websocket.send_json(
-                            {"streamSid": stream_sid, "event": "clear"}
-                        )
-
-                    input_transcription = server_content.get("inputTranscription")
-                    if input_transcription and input_transcription.get("text"):
-                        if pending_role != "customer":
-                            flush_pending_transcript()
-                            pending_role = "customer"
-                        pending_text += input_transcription["text"]
-
-                    output_transcription = server_content.get("outputTranscription")
-                    if output_transcription and output_transcription.get("text"):
-                        if pending_role != "assistant":
-                            flush_pending_transcript()
-                            pending_role = "assistant"
-                        pending_text += output_transcription["text"]
-
-                    model_turn = server_content.get("modelTurn")
-                    if model_turn:
-                        for part in model_turn.get("parts", []):
-                            inline_data = part.get("inlineData")
-                            if not inline_data or not inline_data.get("data"):
-                                continue
-                            if last_speech_end is not None:
-                                latency_ms = (time.monotonic() - last_speech_end) * 1000
-                                print(f"Response latency (silence -> first audio byte): {latency_ms:.0f}ms")
-                                last_speech_end = None
-                            try:
-                                pcm_24k = base64.b64decode(inline_data["data"])
-                                pcm_8k, downsample_state = audioop.ratecv(
-                                    pcm_24k,
+                                pcm_16k, upsample_state = audioop.ratecv(
+                                    pcm_8k,
                                     2,
                                     1,
-                                    GEMINI_OUTPUT_SAMPLE_RATE,
                                     TWILIO_SAMPLE_RATE,
-                                    downsample_state,
+                                    GEMINI_INPUT_SAMPLE_RATE,
+                                    upsample_state,
                                 )
-                                ulaw_bytes = audioop.lin2ulaw(pcm_8k, 2)
-                                audio_delta = {
-                                    "event": "media",
-                                    "streamSid": stream_sid,
-                                    "media": {
-                                        "payload": base64.b64encode(
-                                            ulaw_bytes
-                                        ).decode("utf-8")
-                                    },
+                                audio_message = {
+                                    "realtimeInput": {
+                                        "audio": {
+                                            "data": base64.b64encode(pcm_16k).decode("utf-8"),
+                                            "mimeType": f"audio/pcm;rate={GEMINI_INPUT_SAMPLE_RATE}",
+                                        }
+                                    }
                                 }
-                                await websocket.send_json(audio_delta)
-                            except Exception as e:
-                                print(f"Error processing audio data: {e}")
-            except Exception as e:
-                print(f"Error in send_to_twilio: {e}")
+                                await gemini_ws.send(json.dumps(audio_message))
+                    except WebSocketDisconnect:
+                        print("Client disconnected.")
+                        if gemini_ws.close_code is None:
+                            await gemini_ws.close()
 
-        await asyncio.gather(receive_from_twilio(), send_to_twilio())
-        flush_pending_transcript()
-        await log_call(restaurant, call_sid, customer_phone, transcript, call_started_at)
+                async def send_to_twilio():
+                    """Receive events from Gemini Live, send audio back to Twilio."""
+                    nonlocal downsample_state, last_speech_end, pending_role, pending_text, session_resumption_handle
+                    async for gemini_message in gemini_ws:
+                        response = json.loads(gemini_message)
+
+                        resumption_update = response.get("sessionResumptionUpdate")
+                        if resumption_update:
+                            if resumption_update.get("resumable") and resumption_update.get("newHandle"):
+                                session_resumption_handle = resumption_update["newHandle"]
+                            continue
+
+                        if "setupComplete" in response:
+                            print(f"Gemini Live session ready{' (resumed)' if is_resume else ''}")
+                            if not is_resume:
+                                await gemini_ws.send(
+                                    json.dumps(
+                                        {
+                                            "clientContent": {
+                                                "turns": [
+                                                    {
+                                                        "role": "user",
+                                                        "parts": [
+                                                            {
+                                                                "text": (
+                                                                    "[Inicio de llamada. Saluda al "
+                                                                    "cliente ahora mismo: di el nombre "
+                                                                    "del restaurante y pregunta en que "
+                                                                    "le puedes ayudar hoy. No esperes a "
+                                                                    "que el cliente hable primero.]"
+                                                                )
+                                                            }
+                                                        ],
+                                                    }
+                                                ],
+                                                "turnComplete": True,
+                                            }
+                                        }
+                                    )
+                                )
+                            continue
+
+                        tool_call = response.get("toolCall")
+                        if tool_call:
+                            await handle_tool_call(gemini_ws, tool_call, restaurant, call_sid)
+                            continue
+
+                        server_content = response.get("serverContent")
+                        if not server_content:
+                            continue
+
+                        if server_content.get("interrupted"):
+                            print("Speech started, interrupting AI response")
+                            await websocket.send_json(
+                                {"streamSid": stream_sid, "event": "clear"}
+                            )
+
+                        input_transcription = server_content.get("inputTranscription")
+                        if input_transcription and input_transcription.get("text"):
+                            if pending_role != "customer":
+                                flush_pending_transcript()
+                                pending_role = "customer"
+                            pending_text += input_transcription["text"]
+
+                        output_transcription = server_content.get("outputTranscription")
+                        if output_transcription and output_transcription.get("text"):
+                            if pending_role != "assistant":
+                                flush_pending_transcript()
+                                pending_role = "assistant"
+                            pending_text += output_transcription["text"]
+
+                        model_turn = server_content.get("modelTurn")
+                        if model_turn:
+                            for part in model_turn.get("parts", []):
+                                inline_data = part.get("inlineData")
+                                if not inline_data or not inline_data.get("data"):
+                                    continue
+                                if last_speech_end is not None:
+                                    latency_ms = (time.monotonic() - last_speech_end) * 1000
+                                    print(f"Response latency (silence -> first audio byte): {latency_ms:.0f}ms")
+                                    last_speech_end = None
+                                try:
+                                    pcm_24k = base64.b64decode(inline_data["data"])
+                                    pcm_8k, downsample_state = audioop.ratecv(
+                                        pcm_24k,
+                                        2,
+                                        1,
+                                        GEMINI_OUTPUT_SAMPLE_RATE,
+                                        TWILIO_SAMPLE_RATE,
+                                        downsample_state,
+                                    )
+                                    ulaw_bytes = audioop.lin2ulaw(pcm_8k, 2)
+                                    audio_delta = {
+                                        "event": "media",
+                                        "streamSid": stream_sid,
+                                        "media": {
+                                            "payload": base64.b64encode(
+                                                ulaw_bytes
+                                            ).decode("utf-8")
+                                        },
+                                    }
+                                    await websocket.send_json(audio_delta)
+                                except Exception as e:
+                                    print(f"Error processing audio data: {e}")
+
+                tasks = [asyncio.create_task(receive_from_twilio()), asyncio.create_task(send_to_twilio())]
+                try:
+                    await asyncio.gather(*tasks)
+                except Exception:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    raise
+            break
+        except websockets.exceptions.ConnectionClosedError as e:
+            if attempt < MAX_GEMINI_RECONNECTS:
+                print(f"Gemini Live connection lost ({e}); reconnecting (attempt {attempt + 2})...")
+                await asyncio.sleep(0.5)
+                continue
+            print(f"Gemini Live connection lost permanently after {attempt + 1} attempts: {e}")
+        except Exception as e:
+            print(f"Unexpected error in media stream handling: {e}")
+            break
+
+    flush_pending_transcript()
+    await log_call(restaurant, call_sid, customer_phone, transcript, call_started_at)
 
 
 async def handle_tool_call(gemini_ws, tool_call: dict, restaurant: dict, call_sid):
@@ -627,7 +663,7 @@ def format_menu(menu: dict) -> str:
     )
 
 
-async def send_setup_message(gemini_ws, restaurant: dict):
+async def send_setup_message(gemini_ws, restaurant: dict, resume_handle: str | None = None):
     """Configure the Gemini Live session with this restaurant's prompt and tools."""
     system_message = load_prompt(restaurant.get("system_prompt_file", "system_prompt.txt"))
     system_message = f"Nombre del restaurante: {restaurant['name']}\n\n{system_message}"
@@ -671,5 +707,10 @@ async def send_setup_message(gemini_ws, restaurant: dict):
             "tools": [SUBMIT_ORDER_TOOL],
         }
     }
-    print(f"Configuring Gemini Live session for restaurant '{restaurant['id']}'")
+    if resume_handle:
+        setup_message["setup"]["sessionResumption"] = {"handle": resume_handle}
+    print(
+        f"Configuring Gemini Live session for restaurant '{restaurant['id']}'"
+        + (" (resuming previous session)" if resume_handle else "")
+    )
     await gemini_ws.send(json.dumps(setup_message))
