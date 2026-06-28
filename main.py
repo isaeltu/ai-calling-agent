@@ -21,6 +21,7 @@ load_dotenv()
 DIR_PATH = os.path.dirname(os.path.realpath(__file__))
 PROMPT_CACHE: dict[str, str] = {}
 MENU_CACHE: dict[str, dict] = {}
+MENU_FETCH_STATUS: dict[str, dict] = {}
 MENU_REFRESH_TASKS: set[asyncio.Task] = set()
 MENU_REFRESHING_RESTAURANTS: set[str] = set()
 
@@ -110,8 +111,8 @@ GEMINI_OUTPUT_SAMPLE_RATE = 24000
 # SILENCE_GATE_HANGOVER_MS we stop forwarding it to Gemini -- real speech is
 # always above the RMS threshold and gets sent immediately, so this never
 # trims actual words, only the dead air between them.
-SILENCE_GATE_RMS_THRESHOLD = int(os.getenv("SILENCE_GATE_RMS_THRESHOLD", "300"))
-SILENCE_GATE_HANGOVER_MS = float(os.getenv("SILENCE_GATE_HANGOVER_MS", "220"))
+SILENCE_GATE_RMS_THRESHOLD = int(os.getenv("SILENCE_GATE_RMS_THRESHOLD", "450"))
+SILENCE_GATE_HANGOVER_MS = float(os.getenv("SILENCE_GATE_HANGOVER_MS", "300"))
 
 # Gemini Live's default VAD is tuned for dictation, not a phone call -- it waits
 # longer than a caller expects before deciding they're done talking. Lowering
@@ -122,8 +123,9 @@ SILENCE_GATE_HANGOVER_MS = float(os.getenv("SILENCE_GATE_HANGOVER_MS", "220"))
 GEMINI_END_OF_SPEECH_SILENCE_MS = int(os.getenv("GEMINI_END_OF_SPEECH_SILENCE_MS", "100"))
 GEMINI_START_OF_SPEECH_PADDING_MS = int(os.getenv("GEMINI_START_OF_SPEECH_PADDING_MS", "20"))
 GEMINI_MANUAL_VAD = env_bool("GEMINI_MANUAL_VAD", True)
-GEMINI_MANUAL_VAD_SILENCE_MS = float(os.getenv("GEMINI_MANUAL_VAD_SILENCE_MS", "260"))
-GEMINI_MANUAL_VAD_PREFIX_MS = float(os.getenv("GEMINI_MANUAL_VAD_PREFIX_MS", "120"))
+GEMINI_MANUAL_VAD_SILENCE_MS = float(os.getenv("GEMINI_MANUAL_VAD_SILENCE_MS", "320"))
+GEMINI_MANUAL_VAD_PREFIX_MS = float(os.getenv("GEMINI_MANUAL_VAD_PREFIX_MS", "160"))
+GEMINI_MANUAL_VAD_START_MS = float(os.getenv("GEMINI_MANUAL_VAD_START_MS", "80"))
 
 # Safety net, not the primary brevity control (that's the prompt's "1-2
 # sentences" instruction, which works most of the time). This preview model
@@ -133,7 +135,7 @@ GEMINI_MANUAL_VAD_PREFIX_MS = float(os.getenv("GEMINI_MANUAL_VAD_PREFIX_MS", "12
 # words, so a low cap that cuts the rare bad case off quickly beats a high
 # one hoping it "finishes". Normal replies finish in ~75-100 tokens (~3-4s),
 # well under this.
-GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "140"))
+GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "240"))
 GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "MINIMAL")
 GEMINI_ENABLE_TRANSCRIPTIONS = env_bool("GEMINI_ENABLE_TRANSCRIPTIONS", False)
 
@@ -142,7 +144,7 @@ GEMINI_ENABLE_TRANSCRIPTIONS = env_bool("GEMINI_ENABLE_TRANSCRIPTIONS", False)
 # in the background so calls do not wait on Supabase when the menu was just read.
 MENU_CACHE_TTL_SECONDS = float(os.getenv("MENU_CACHE_TTL_SECONDS", "300"))
 MENU_STALE_TTL_SECONDS = float(os.getenv("MENU_STALE_TTL_SECONDS", "3600"))
-MENU_FETCH_TIMEOUT_SECONDS = float(os.getenv("MENU_FETCH_TIMEOUT_SECONDS", "1.0"))
+MENU_FETCH_TIMEOUT_SECONDS = float(os.getenv("MENU_FETCH_TIMEOUT_SECONDS", "2.5"))
 MENU_MAX_ITEMS_IN_PROMPT = int(os.getenv("MENU_MAX_ITEMS_IN_PROMPT", "120"))
 ORDER_WEBHOOK_TIMEOUT_SECONDS = float(os.getenv("ORDER_WEBHOOK_TIMEOUT_SECONDS", "3.0"))
 CALL_LOG_TIMEOUT_SECONDS = float(os.getenv("CALL_LOG_TIMEOUT_SECONDS", "2.0"))
@@ -248,6 +250,56 @@ async def health_check():
             "missing": missing,
         }
     return {"status": "healthy", "message": "AI Voice Assistant is running!"}
+
+
+@app.get("/menu-status")
+async def menu_status(restaurant_id: str | None = None):
+    """Report menu cache/fetch health without exposing secrets or menu contents."""
+    restaurants = (
+        [RESTAURANTS_BY_ID[restaurant_id]]
+        if restaurant_id and restaurant_id in RESTAURANTS_BY_ID
+        else list(RESTAURANTS_BY_ID.values())
+    )
+    now = time.monotonic()
+    return {
+        "restaurants": [
+            {
+                "restaurant_id": restaurant["id"],
+                "restaurant_name": restaurant["name"],
+                "has_supabase_url": bool(SUPABASE_URL),
+                "has_supabase_anon_key": bool(SUPABASE_ANON_KEY),
+                "has_order_api_key": bool(restaurant.get("order_webhook_api_key")),
+                "cached": restaurant["id"] in MENU_CACHE,
+                "cache_age_seconds": (
+                    round(now - MENU_CACHE[restaurant["id"]]["fetched_at"], 1)
+                    if restaurant["id"] in MENU_CACHE
+                    else None
+                ),
+                "product_count": (
+                    len(MENU_CACHE[restaurant["id"]]["product_names"])
+                    if restaurant["id"] in MENU_CACHE
+                    else 0
+                ),
+                "last_fetch": MENU_FETCH_STATUS.get(restaurant["id"]),
+            }
+            for restaurant in restaurants
+        ]
+    }
+
+
+@app.post("/menu-refresh")
+async def menu_refresh(restaurant_id: str):
+    """Force-refresh one restaurant menu cache for deployment diagnostics."""
+    restaurant = RESTAURANTS_BY_ID.get(restaurant_id)
+    if not restaurant:
+        return {"status": "error", "message": f"Unknown restaurant_id: {restaurant_id}"}
+    entry = await refresh_menu_cache(restaurant)
+    status = MENU_FETCH_STATUS.get(restaurant_id)
+    return {
+        "status": "ok" if entry else "error",
+        "product_count": len(entry["product_names"]) if entry else 0,
+        "last_fetch": status,
+    }
 
 
 class CallRequest(BaseModel):
@@ -425,6 +477,7 @@ async def handle_media_stream(websocket: WebSocket):
                     """Receive audio data from Twilio and send it to Gemini Live."""
                     nonlocal upsample_state, last_speech_end
                     silence_ms = 0.0
+                    speech_ms = 0.0
                     was_speaking = False
                     activity_started = False
                     prefix_audio_frames = []
@@ -465,17 +518,32 @@ async def handle_media_stream(websocket: WebSocket):
 
                                 if GEMINI_MANUAL_VAD:
                                     if is_speech:
+                                        speech_ms += frame_ms
                                         if activity_started and silence_ms > 0:
                                             last_speech_end = None
                                         silence_ms = 0.0
                                         was_speaking = True
                                         if not activity_started:
+                                            prefix_audio_frames.append(pcm_8k)
+                                            prefix_audio_ms += frame_ms
+                                            if speech_ms < GEMINI_MANUAL_VAD_START_MS:
+                                                while (
+                                                    prefix_audio_ms
+                                                    > GEMINI_MANUAL_VAD_PREFIX_MS
+                                                    and prefix_audio_frames
+                                                ):
+                                                    dropped_pcm_8k = prefix_audio_frames.pop(0)
+                                                    prefix_audio_ms -= (
+                                                        len(dropped_pcm_8k) / 2
+                                                    ) / TWILIO_SAMPLE_RATE * 1000
+                                                continue
                                             activity_started = True
                                             await send_activity_event("activityStart")
                                             for prefix_pcm_8k in prefix_audio_frames:
                                                 await send_pcm_8k_to_gemini(prefix_pcm_8k)
                                             prefix_audio_frames = []
                                             prefix_audio_ms = 0.0
+                                            continue
                                         await send_pcm_8k_to_gemini(pcm_8k)
                                         continue
 
@@ -491,8 +559,10 @@ async def handle_media_stream(websocket: WebSocket):
                                         await send_activity_event("activityEnd")
                                         activity_started = False
                                         silence_ms = 0.0
+                                        speech_ms = 0.0
                                         continue
 
+                                    speech_ms = 0.0
                                     prefix_audio_frames.append(pcm_8k)
                                     prefix_audio_ms += frame_ms
                                     while (
@@ -770,8 +840,17 @@ async def fetch_menu(restaurant: dict) -> dict | None:
     real ones); voice_create_order re-validates against the same table when
     the order is submitted, so this is just for what the agent says out loud.
     """
+    restaurant_id = restaurant["id"]
     api_key = restaurant.get("order_webhook_api_key")
     if not SUPABASE_URL or not SUPABASE_ANON_KEY or not api_key:
+        MENU_FETCH_STATUS[restaurant_id] = {
+            "ok": False,
+            "reason": "missing_config",
+            "has_supabase_url": bool(SUPABASE_URL),
+            "has_supabase_anon_key": bool(SUPABASE_ANON_KEY),
+            "has_order_api_key": bool(api_key),
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
         return None
 
     try:
@@ -789,10 +868,29 @@ async def fetch_menu(restaurant: dict) -> dict | None:
             )
         if resp.status_code >= 400:
             print(f"Error fetching menu for '{restaurant['id']}': HTTP {resp.status_code}")
+            MENU_FETCH_STATUS[restaurant_id] = {
+                "ok": False,
+                "reason": "http_error",
+                "status_code": resp.status_code,
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+            }
             return None
-        return resp.json()
+        menu = resp.json()
+        MENU_FETCH_STATUS[restaurant_id] = {
+            "ok": True,
+            "reason": "ok",
+            "product_count": len(menu.get("products") or []),
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return menu
     except Exception as e:
         print(f"Error fetching menu for '{restaurant['id']}': {e}")
+        MENU_FETCH_STATUS[restaurant_id] = {
+            "ok": False,
+            "reason": type(e).__name__,
+            "message": str(e),
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
         return None
 
 
