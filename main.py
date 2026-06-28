@@ -90,6 +90,14 @@ REQUIRED_RUNTIME_CONFIG = {
     "PUBLIC_BASE_URL": PUBLIC_BASE_URL,
 }
 
+
+def env_bool(name: str, default: bool = False) -> bool:
+    """Parse boolean env vars used for latency tradeoffs."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
 # Twilio media streams use 8kHz mu-law; Gemini Live expects 16kHz PCM in
 # and returns 24kHz PCM out, so audio is resampled/transcoded both ways.
 TWILIO_SAMPLE_RATE = 8000
@@ -103,7 +111,7 @@ GEMINI_OUTPUT_SAMPLE_RATE = 24000
 # always above the RMS threshold and gets sent immediately, so this never
 # trims actual words, only the dead air between them.
 SILENCE_GATE_RMS_THRESHOLD = int(os.getenv("SILENCE_GATE_RMS_THRESHOLD", "300"))
-SILENCE_GATE_HANGOVER_MS = float(os.getenv("SILENCE_GATE_HANGOVER_MS", "250"))
+SILENCE_GATE_HANGOVER_MS = float(os.getenv("SILENCE_GATE_HANGOVER_MS", "220"))
 
 # Gemini Live's default VAD is tuned for dictation, not a phone call -- it waits
 # longer than a caller expects before deciding they're done talking. Lowering
@@ -111,8 +119,11 @@ SILENCE_GATE_HANGOVER_MS = float(os.getenv("SILENCE_GATE_HANGOVER_MS", "250"))
 # "the customer finished" sooner, so the agent starts answering faster. Lowering
 # prefixPaddingMs (start-of-speech sensitivity) shaves the same delay off the
 # other end, at the start of each utterance.
-GEMINI_END_OF_SPEECH_SILENCE_MS = int(os.getenv("GEMINI_END_OF_SPEECH_SILENCE_MS", "120"))
-GEMINI_START_OF_SPEECH_PADDING_MS = int(os.getenv("GEMINI_START_OF_SPEECH_PADDING_MS", "50"))
+GEMINI_END_OF_SPEECH_SILENCE_MS = int(os.getenv("GEMINI_END_OF_SPEECH_SILENCE_MS", "100"))
+GEMINI_START_OF_SPEECH_PADDING_MS = int(os.getenv("GEMINI_START_OF_SPEECH_PADDING_MS", "20"))
+GEMINI_MANUAL_VAD = env_bool("GEMINI_MANUAL_VAD", True)
+GEMINI_MANUAL_VAD_SILENCE_MS = float(os.getenv("GEMINI_MANUAL_VAD_SILENCE_MS", "260"))
+GEMINI_MANUAL_VAD_PREFIX_MS = float(os.getenv("GEMINI_MANUAL_VAD_PREFIX_MS", "120"))
 
 # Safety net, not the primary brevity control (that's the prompt's "1-2
 # sentences" instruction, which works most of the time). This preview model
@@ -123,6 +134,8 @@ GEMINI_START_OF_SPEECH_PADDING_MS = int(os.getenv("GEMINI_START_OF_SPEECH_PADDIN
 # one hoping it "finishes". Normal replies finish in ~75-100 tokens (~3-4s),
 # well under this.
 GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "140"))
+GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "MINIMAL")
+GEMINI_ENABLE_TRANSCRIPTIONS = env_bool("GEMINI_ENABLE_TRANSCRIPTIONS", False)
 
 # Menu lookups are the main non-model dependency in the hot path. Keep them
 # short, cache successful responses, and use stale-but-real data while refreshing
@@ -413,6 +426,33 @@ async def handle_media_stream(websocket: WebSocket):
                     nonlocal upsample_state, last_speech_end
                     silence_ms = 0.0
                     was_speaking = False
+                    activity_started = False
+                    prefix_audio_frames = []
+                    prefix_audio_ms = 0.0
+
+                    async def send_activity_event(event_name: str) -> None:
+                        await gemini_ws.send(json.dumps({"realtimeInput": {event_name: {}}}))
+
+                    async def send_pcm_8k_to_gemini(pcm_8k: bytes) -> None:
+                        nonlocal upsample_state
+                        pcm_16k, upsample_state = audioop.ratecv(
+                            pcm_8k,
+                            2,
+                            1,
+                            TWILIO_SAMPLE_RATE,
+                            GEMINI_INPUT_SAMPLE_RATE,
+                            upsample_state,
+                        )
+                        audio_message = {
+                            "realtimeInput": {
+                                "audio": {
+                                    "data": base64.b64encode(pcm_16k).decode("utf-8"),
+                                    "mimeType": f"audio/pcm;rate={GEMINI_INPUT_SAMPLE_RATE}",
+                                }
+                            }
+                        }
+                        await gemini_ws.send(json.dumps(audio_message))
+
                     try:
                         async for message in websocket.iter_text():
                             data = json.loads(message)
@@ -422,6 +462,49 @@ async def handle_media_stream(websocket: WebSocket):
 
                                 frame_ms = (len(pcm_8k) / 2) / TWILIO_SAMPLE_RATE * 1000
                                 is_speech = audioop.rms(pcm_8k, 2) >= SILENCE_GATE_RMS_THRESHOLD
+
+                                if GEMINI_MANUAL_VAD:
+                                    if is_speech:
+                                        if activity_started and silence_ms > 0:
+                                            last_speech_end = None
+                                        silence_ms = 0.0
+                                        was_speaking = True
+                                        if not activity_started:
+                                            activity_started = True
+                                            await send_activity_event("activityStart")
+                                            for prefix_pcm_8k in prefix_audio_frames:
+                                                await send_pcm_8k_to_gemini(prefix_pcm_8k)
+                                            prefix_audio_frames = []
+                                            prefix_audio_ms = 0.0
+                                        await send_pcm_8k_to_gemini(pcm_8k)
+                                        continue
+
+                                    if activity_started:
+                                        if was_speaking:
+                                            last_speech_end = time.monotonic()
+                                            was_speaking = False
+                                        silence_ms += frame_ms
+                                        if silence_ms <= GEMINI_MANUAL_VAD_SILENCE_MS:
+                                            await send_pcm_8k_to_gemini(pcm_8k)
+                                            continue
+
+                                        await send_activity_event("activityEnd")
+                                        activity_started = False
+                                        silence_ms = 0.0
+                                        continue
+
+                                    prefix_audio_frames.append(pcm_8k)
+                                    prefix_audio_ms += frame_ms
+                                    while (
+                                        prefix_audio_ms > GEMINI_MANUAL_VAD_PREFIX_MS
+                                        and prefix_audio_frames
+                                    ):
+                                        dropped_pcm_8k = prefix_audio_frames.pop(0)
+                                        prefix_audio_ms -= (
+                                            len(dropped_pcm_8k) / 2
+                                        ) / TWILIO_SAMPLE_RATE * 1000
+                                    continue
+
                                 if is_speech:
                                     silence_ms = 0.0
                                     was_speaking = True
@@ -433,23 +516,7 @@ async def handle_media_stream(websocket: WebSocket):
                                 if silence_ms > SILENCE_GATE_HANGOVER_MS:
                                     continue
 
-                                pcm_16k, upsample_state = audioop.ratecv(
-                                    pcm_8k,
-                                    2,
-                                    1,
-                                    TWILIO_SAMPLE_RATE,
-                                    GEMINI_INPUT_SAMPLE_RATE,
-                                    upsample_state,
-                                )
-                                audio_message = {
-                                    "realtimeInput": {
-                                        "audio": {
-                                            "data": base64.b64encode(pcm_16k).decode("utf-8"),
-                                            "mimeType": f"audio/pcm;rate={GEMINI_INPUT_SAMPLE_RATE}",
-                                        }
-                                    }
-                                }
-                                await gemini_ws.send(json.dumps(audio_message))
+                                await send_pcm_8k_to_gemini(pcm_8k)
                     except WebSocketDisconnect:
                         print("Client disconnected.")
                         if gemini_ws.close_code is None:
@@ -473,24 +540,14 @@ async def handle_media_stream(websocket: WebSocket):
                                 await gemini_ws.send(
                                     json.dumps(
                                         {
-                                            "clientContent": {
-                                                "turns": [
-                                                    {
-                                                        "role": "user",
-                                                        "parts": [
-                                                            {
-                                                                "text": (
-                                                                    "[Inicio de llamada. Saluda al "
-                                                                    "cliente ahora mismo: di el nombre "
-                                                                    "del restaurante y pregunta en que "
-                                                                    "le puedes ayudar hoy. No esperes a "
-                                                                    "que el cliente hable primero.]"
-                                                                )
-                                                            }
-                                                        ],
-                                                    }
-                                                ],
-                                                "turnComplete": True,
+                                            "realtimeInput": {
+                                                "text": (
+                                                    "[Inicio de llamada. Saluda al "
+                                                    "cliente ahora mismo: di el nombre "
+                                                    "del restaurante y pregunta en que "
+                                                    "le puedes ayudar hoy. No esperes a "
+                                                    "que el cliente hable primero.]"
+                                                )
                                             }
                                         }
                                     )
@@ -893,11 +950,13 @@ async def send_setup_message(gemini_ws, restaurant: dict, resume_handle: str | N
                 "responseModalities": ["AUDIO"],
                 "temperature": 0.2,
                 "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS,
+                "thinkingConfig": {"thinkingLevel": GEMINI_THINKING_LEVEL},
                 "speechConfig": {
                     "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}
                 },
             },
             "realtimeInputConfig": {
+                "turnCoverage": "TURN_INCLUDES_ONLY_ACTIVITY",
                 "automaticActivityDetection": {
                     "startOfSpeechSensitivity": "START_SENSITIVITY_HIGH",
                     "endOfSpeechSensitivity": "END_SENSITIVITY_HIGH",
@@ -905,12 +964,18 @@ async def send_setup_message(gemini_ws, restaurant: dict, resume_handle: str | N
                     "silenceDurationMs": GEMINI_END_OF_SPEECH_SILENCE_MS,
                 }
             },
-            "inputAudioTranscription": {},
-            "outputAudioTranscription": {},
             "systemInstruction": {"parts": [{"text": system_message}]},
             "tools": [SUBMIT_ORDER_TOOL],
         }
     }
+    if GEMINI_MANUAL_VAD:
+        setup_message["setup"]["realtimeInputConfig"] = {
+            "turnCoverage": "TURN_INCLUDES_ONLY_ACTIVITY",
+            "automaticActivityDetection": {"disabled": True}
+        }
+    if GEMINI_ENABLE_TRANSCRIPTIONS:
+        setup_message["setup"]["inputAudioTranscription"] = {}
+        setup_message["setup"]["outputAudioTranscription"] = {}
     if resume_handle:
         setup_message["setup"]["sessionResumption"] = {"handle": resume_handle}
     print(
