@@ -19,14 +19,23 @@ from twilio.twiml.voice_response import Connect, Stream, VoiceResponse
 load_dotenv()
 
 DIR_PATH = os.path.dirname(os.path.realpath(__file__))
+PROMPT_CACHE: dict[str, str] = {}
+MENU_CACHE: dict[str, dict] = {}
+MENU_REFRESH_TASKS: set[asyncio.Task] = set()
+MENU_REFRESHING_RESTAURANTS: set[str] = set()
 
 
 def load_prompt(file_name: str) -> str:
     """Load a system prompt file from the prompts/ directory."""
+    if file_name in PROMPT_CACHE:
+        return PROMPT_CACHE[file_name]
+
     prompt_path = os.path.join(DIR_PATH, "prompts", file_name)
     try:
         with open(prompt_path, "r", encoding="utf-8") as file:
-            return file.read().strip()
+            prompt = file.read().strip()
+            PROMPT_CACHE[file_name] = prompt
+            return prompt
     except FileNotFoundError:
         print(f"Could not find file: {prompt_path}")
         raise
@@ -87,7 +96,7 @@ GEMINI_OUTPUT_SAMPLE_RATE = 24000
 # always above the RMS threshold and gets sent immediately, so this never
 # trims actual words, only the dead air between them.
 SILENCE_GATE_RMS_THRESHOLD = int(os.getenv("SILENCE_GATE_RMS_THRESHOLD", "300"))
-SILENCE_GATE_HANGOVER_MS = float(os.getenv("SILENCE_GATE_HANGOVER_MS", "400"))
+SILENCE_GATE_HANGOVER_MS = float(os.getenv("SILENCE_GATE_HANGOVER_MS", "250"))
 
 # Gemini Live's default VAD is tuned for dictation, not a phone call -- it waits
 # longer than a caller expects before deciding they're done talking. Lowering
@@ -95,7 +104,7 @@ SILENCE_GATE_HANGOVER_MS = float(os.getenv("SILENCE_GATE_HANGOVER_MS", "400"))
 # "the customer finished" sooner, so the agent starts answering faster. Lowering
 # prefixPaddingMs (start-of-speech sensitivity) shaves the same delay off the
 # other end, at the start of each utterance.
-GEMINI_END_OF_SPEECH_SILENCE_MS = int(os.getenv("GEMINI_END_OF_SPEECH_SILENCE_MS", "150"))
+GEMINI_END_OF_SPEECH_SILENCE_MS = int(os.getenv("GEMINI_END_OF_SPEECH_SILENCE_MS", "120"))
 GEMINI_START_OF_SPEECH_PADDING_MS = int(os.getenv("GEMINI_START_OF_SPEECH_PADDING_MS", "50"))
 
 # Safety net, not the primary brevity control (that's the prompt's "1-2
@@ -106,7 +115,17 @@ GEMINI_START_OF_SPEECH_PADDING_MS = int(os.getenv("GEMINI_START_OF_SPEECH_PADDIN
 # words, so a low cap that cuts the rare bad case off quickly beats a high
 # one hoping it "finishes". Normal replies finish in ~75-100 tokens (~3-4s),
 # well under this.
-GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "220"))
+GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "140"))
+
+# Menu lookups are the main non-model dependency in the hot path. Keep them
+# short, cache successful responses, and use stale-but-real data while refreshing
+# in the background so calls do not wait on Supabase when the menu was just read.
+MENU_CACHE_TTL_SECONDS = float(os.getenv("MENU_CACHE_TTL_SECONDS", "300"))
+MENU_STALE_TTL_SECONDS = float(os.getenv("MENU_STALE_TTL_SECONDS", "3600"))
+MENU_FETCH_TIMEOUT_SECONDS = float(os.getenv("MENU_FETCH_TIMEOUT_SECONDS", "1.0"))
+MENU_MAX_ITEMS_IN_PROMPT = int(os.getenv("MENU_MAX_ITEMS_IN_PROMPT", "120"))
+ORDER_WEBHOOK_TIMEOUT_SECONDS = float(os.getenv("ORDER_WEBHOOK_TIMEOUT_SECONDS", "3.0"))
+CALL_LOG_TIMEOUT_SECONDS = float(os.getenv("CALL_LOG_TIMEOUT_SECONDS", "2.0"))
 
 SUBMIT_ORDER_TOOL = {
     "functionDeclarations": [
@@ -174,6 +193,20 @@ if not GEMINI_API_KEY:
 
 if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
     raise ValueError("Missing Twilio configuration. Please set it in the .env file.")
+
+
+@app.on_event("startup")
+async def warm_restaurant_menus() -> None:
+    """Preload live menus so the first call does not wait on the database."""
+    if not RESTAURANTS_BY_ID:
+        return
+
+    results = await asyncio.gather(
+        *(refresh_menu_cache(restaurant) for restaurant in RESTAURANTS_BY_ID.values()),
+        return_exceptions=True,
+    )
+    loaded = sum(1 for result in results if isinstance(result, dict))
+    print(f"Preloaded {loaded}/{len(RESTAURANTS_BY_ID)} restaurant menu cache(s)")
 
 
 @app.get("/")
@@ -541,6 +574,10 @@ async def submit_order(restaurant: dict, order_args: dict, call_sid) -> dict:
             "message": "No order webhook configured for this restaurant.",
         }
 
+    validation_error = validate_order_items(restaurant, order_args.get("items", []))
+    if validation_error:
+        return validation_error
+
     payload = {
         "event": "order.created",
         "restaurant_id": restaurant["id"],
@@ -565,7 +602,7 @@ async def submit_order(restaurant: dict, order_args: dict, call_sid) -> dict:
 
     print(f"Submitting order for restaurant '{restaurant['id']}': {payload}")
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=ORDER_WEBHOOK_TIMEOUT_SECONDS) as client:
             resp = await client.post(webhook_url, json=payload, headers=headers)
         try:
             body = resp.json()
@@ -593,7 +630,7 @@ async def log_call(restaurant: dict, call_sid, customer_phone, transcript: list,
         return
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=CALL_LOG_TIMEOUT_SECONDS) as client:
             resp = await client.post(
                 f"{SUPABASE_URL}/rest/v1/rpc/voice_log_call",
                 json={
@@ -616,6 +653,19 @@ async def log_call(restaurant: dict, call_sid, customer_phone, transcript: list,
         print(f"Error logging call '{call_sid}': {e}")
 
 
+def build_http_timeout(seconds: float) -> httpx.Timeout:
+    """Create a low-latency timeout with a short connection budget."""
+    connect_timeout = min(seconds, 0.4)
+    pool_timeout = min(seconds, 0.4)
+    return httpx.Timeout(
+        timeout=seconds,
+        connect=connect_timeout,
+        read=seconds,
+        write=seconds,
+        pool=pool_timeout,
+    )
+
+
 async def fetch_menu(restaurant: dict) -> dict | None:
     """Fetch this restaurant's live menu from RestoPOS via rpc/voice_get_menu.
 
@@ -629,7 +679,9 @@ async def fetch_menu(restaurant: dict) -> dict | None:
         return None
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(
+            timeout=build_http_timeout(MENU_FETCH_TIMEOUT_SECONDS)
+        ) as client:
             resp = await client.post(
                 f"{SUPABASE_URL}/rest/v1/rpc/voice_get_menu",
                 json={"p_api_key": api_key},
@@ -648,6 +700,108 @@ async def fetch_menu(restaurant: dict) -> dict | None:
         return None
 
 
+def cache_menu(restaurant: dict, menu: dict) -> dict:
+    """Store derived menu data so setup and order validation are instant."""
+    restaurant_id = restaurant["id"]
+    products = menu.get("products") or []
+    product_names = {
+        str(product.get("name", "")).strip().casefold()
+        for product in products
+        if product.get("name")
+    }
+    MENU_CACHE[restaurant_id] = {
+        "menu": menu,
+        "menu_text": format_menu(menu),
+        "product_names": product_names,
+        "fetched_at": time.monotonic(),
+    }
+    return MENU_CACHE[restaurant_id]
+
+
+async def refresh_menu_cache(restaurant: dict) -> dict | None:
+    """Refresh the menu cache from RestoPOS."""
+    menu = await fetch_menu(restaurant)
+    if not menu:
+        return None
+    entry = cache_menu(restaurant, menu)
+    print(
+        f"Menu cache refreshed for '{restaurant['id']}' "
+        f"({len(entry['product_names'])} products)"
+    )
+    return entry
+
+
+def schedule_menu_refresh(restaurant: dict) -> None:
+    """Start a background menu refresh without leaking completed tasks."""
+    restaurant_id = restaurant["id"]
+    if restaurant_id in MENU_REFRESHING_RESTAURANTS:
+        return
+
+    MENU_REFRESHING_RESTAURANTS.add(restaurant_id)
+    task = asyncio.create_task(refresh_menu_cache(restaurant))
+    MENU_REFRESH_TASKS.add(task)
+
+    def cleanup(done_task: asyncio.Task) -> None:
+        MENU_REFRESH_TASKS.discard(done_task)
+        MENU_REFRESHING_RESTAURANTS.discard(restaurant_id)
+        try:
+            done_task.result()
+        except Exception as exc:
+            print(f"Background menu refresh failed for '{restaurant_id}': {exc}")
+
+    task.add_done_callback(cleanup)
+
+
+async def get_cached_menu(restaurant: dict) -> dict | None:
+    """Return fresh menu data fast, falling back to stale real data if needed."""
+    restaurant_id = restaurant["id"]
+    entry = MENU_CACHE.get(restaurant_id)
+    now = time.monotonic()
+
+    if entry:
+        age = now - entry["fetched_at"]
+        if age <= MENU_CACHE_TTL_SECONDS:
+            return entry
+        if age <= MENU_STALE_TTL_SECONDS:
+            schedule_menu_refresh(restaurant)
+            return entry
+
+    entry = await refresh_menu_cache(restaurant)
+    if entry:
+        return entry
+
+    stale_entry = MENU_CACHE.get(restaurant_id)
+    if stale_entry and now - stale_entry["fetched_at"] <= MENU_STALE_TTL_SECONDS:
+        return stale_entry
+    return None
+
+
+def validate_order_items(restaurant: dict, items: list) -> dict | None:
+    """Reject model-submitted items that are not in the cached live menu."""
+    entry = MENU_CACHE.get(restaurant["id"])
+    product_names = entry.get("product_names") if entry else None
+    if not product_names:
+        return None
+
+    invalid_items = [
+        item.get("name")
+        for item in items
+        if str(item.get("name", "")).strip().casefold() not in product_names
+    ]
+    if not invalid_items:
+        return None
+
+    valid_examples = sorted(entry["product_names"])[:6]
+    return {
+        "status": "error",
+        "message": (
+            "No envies el pedido todavia. Estos productos no existen en el menu "
+            f"actual: {', '.join(invalid_items)}. Pide al cliente elegir un "
+            f"producto real del menu. Ejemplos validos: {', '.join(valid_examples)}."
+        ),
+    }
+
+
 def format_menu(menu: dict) -> str:
     """Render the RestoPOS menu payload as text to append to the system prompt."""
     products = menu.get("products") or []
@@ -656,7 +810,7 @@ def format_menu(menu: dict) -> str:
 
     category_names = {c["id"]: c["name"] for c in menu.get("categories") or []}
     items_by_category: dict[str, list[str]] = {}
-    for product in products:
+    for product in products[:MENU_MAX_ITEMS_IN_PROMPT]:
         category_name = category_names.get(product.get("categoryId"), "Otros")
         line = f"- {product['name']}: {product['price']}"
         if product.get("description"):
@@ -679,18 +833,18 @@ async def send_setup_message(gemini_ws, restaurant: dict, resume_handle: str | N
     system_message = f"Nombre del restaurante: {restaurant['name']}\n\n{system_message}"
     voice = restaurant.get("voice", GEMINI_VOICE)
 
-    menu = await fetch_menu(restaurant)
-    if menu:
-        menu_text = format_menu(menu)
+    menu_entry = await get_cached_menu(restaurant)
+    if menu_entry:
+        menu_text = menu_entry.get("menu_text")
         if menu_text:
             system_message = f"{system_message}\n\n{menu_text}"
-        extra_prompt = (menu.get("restaurant") or {}).get("extraPrompt")
+        extra_prompt = (menu_entry["menu"].get("restaurant") or {}).get("extraPrompt")
         if extra_prompt:
             system_message = f"{system_message}\n\n{extra_prompt}"
     else:
         print(
             f"Could not load live menu for restaurant '{restaurant['id']}'; "
-            "falling back to the static prompt only."
+            "using static prompt without product names."
         )
 
     setup_message = {
