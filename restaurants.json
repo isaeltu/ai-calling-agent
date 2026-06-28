@@ -2,7 +2,7 @@
   {
     "id": "10000000-0000-0000-0000-000000000001",
     "name": "La cocina del Chicharron",
-    "twilio_phone_number": "+16823843954",
+    "twilio_phone_number": "+15102408364",
     "voice": "Puck",
     "system_prompt_file": "system_prompt.txt",
     "order_webhook_url": "https://lxurfpnlvmrvarwbzygl.supabase.co/functions/v1/voice-order-webhook",

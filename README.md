@@ -85,7 +85,7 @@ PORT=8000
 ```bash
 curl -X POST "http://localhost:8000/make-call" \
   -H "Content-Type: application/json" \
-  -d '{"to_phone_number": "+1234567890"}'
+  -d '{"to_phone_number": "+1234567890", "restaurant_id": "10000000-0000-0000-0000-000000000001"}'
 ```
 
 ## Architecture
