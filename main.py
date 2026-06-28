@@ -83,6 +83,13 @@ GEMINI_WS_URL = (
     f"?key={GEMINI_API_KEY}"
 )
 
+REQUIRED_RUNTIME_CONFIG = {
+    "GEMINI_API_KEY": GEMINI_API_KEY,
+    "TWILIO_ACCOUNT_SID": TWILIO_ACCOUNT_SID,
+    "TWILIO_AUTH_TOKEN": TWILIO_AUTH_TOKEN,
+    "PUBLIC_BASE_URL": PUBLIC_BASE_URL,
+}
+
 # Twilio media streams use 8kHz mu-law; Gemini Live expects 16kHz PCM in
 # and returns 24kHz PCM out, so audio is resampled/transcoded both ways.
 TWILIO_SAMPLE_RATE = 8000
@@ -188,11 +195,19 @@ SUBMIT_ORDER_TOOL = {
 
 app = FastAPI()
 
-if not GEMINI_API_KEY:
-    raise ValueError("Missing the Gemini API key. Please set it in the .env file.")
 
-if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
-    raise ValueError("Missing Twilio configuration. Please set it in the .env file.")
+def missing_runtime_config(*names: str) -> list[str]:
+    """Return required env vars that are missing without exposing secret values."""
+    return [name for name in names if not REQUIRED_RUNTIME_CONFIG.get(name)]
+
+
+def public_base_url() -> str | None:
+    """Return a Twilio-ready public URL, accepting values with or without scheme."""
+    if not PUBLIC_BASE_URL:
+        return None
+    if PUBLIC_BASE_URL.startswith(("http://", "https://")):
+        return PUBLIC_BASE_URL.rstrip("/")
+    return f"https://{PUBLIC_BASE_URL.rstrip('/')}"
 
 
 @app.on_event("startup")
@@ -212,6 +227,13 @@ async def warm_restaurant_menus() -> None:
 @app.get("/")
 async def health_check():
     """Health check endpoint."""
+    missing = missing_runtime_config(*REQUIRED_RUNTIME_CONFIG.keys())
+    if missing:
+        return {
+            "status": "misconfigured",
+            "message": "AI Voice Assistant is running, but configuration is missing.",
+            "missing": missing,
+        }
     return {"status": "healthy", "message": "AI Voice Assistant is running!"}
 
 
@@ -223,6 +245,18 @@ class CallRequest(BaseModel):
 @app.post("/make-call")
 async def make_call(request: CallRequest):
     """Initiate an outbound call to the specified phone number on behalf of a restaurant."""
+    missing = missing_runtime_config(
+        "TWILIO_ACCOUNT_SID",
+        "TWILIO_AUTH_TOKEN",
+        "PUBLIC_BASE_URL",
+    )
+    if missing:
+        return {
+            "error": "Missing runtime configuration.",
+            "missing": missing,
+            "status": "failed",
+        }
+
     restaurant = RESTAURANTS_BY_ID.get(request.restaurant_id)
     if not restaurant:
         return {
@@ -232,12 +266,13 @@ async def make_call(request: CallRequest):
 
     try:
         client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        base_url = public_base_url()
         call = client.calls.create(
-            url=f"{PUBLIC_BASE_URL}/outgoing-call?restaurant_id={restaurant['id']}",
+            url=f"{base_url}/outgoing-call?restaurant_id={restaurant['id']}",
             to=request.to_phone_number,
             from_=restaurant["twilio_phone_number"],
             record=True,
-            recording_status_callback=f"{PUBLIC_BASE_URL}/recording-status",
+            recording_status_callback=f"{base_url}/recording-status",
             recording_status_callback_method="POST",
         )
         print(f"Call initiated with SID: {call.sid}")
@@ -331,6 +366,10 @@ async def handle_media_stream(websocket: WebSocket):
 
     if not restaurant:
         print(f"Unknown restaurant_id on media-stream: {restaurant_id}")
+        await websocket.close()
+        return
+    if missing_runtime_config("GEMINI_API_KEY"):
+        print("Cannot start Gemini Live stream: missing GEMINI_API_KEY")
         await websocket.close()
         return
 
